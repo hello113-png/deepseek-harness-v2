@@ -562,6 +562,41 @@ const scrapeDom = async () => page.evaluate(() => {
     label: (text.match(/(Thought for [\d.]+ seconds?|Thinking[^\n]*)/) || [])[1] || null
   };
 });
+
+// DeepSeek renders a "Continue" button under an answer it stopped early. The
+// page only has it inside the newest assistant message, so the search is scoped
+// there: an older message's button must never be clicked by mistake.
+const clickContinue = async () => {
+  try {
+    return await page.evaluate(() => {
+  const label = /^continue(\s+generating)?$/i;
+  const visible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 1 && rect.height > 1;
+  };
+  const msgs = Array.from(document.querySelectorAll(".ds-message"))
+    .filter((m) => m.querySelector(".ds-markdown.ds-assistant-message-main-content, .ds-think-content"));
+  const scope = msgs[msgs.length - 1] || null;
+  if (!scope) return null;
+  const nodes = Array.from(scope.querySelectorAll(
+    ".ds-button__content, .ds-button, button, [role='button']"));
+  let found = null;
+  for (const node of nodes) {
+    const text = (node.innerText || "").replace(/\s+/g, " ").trim();
+    if (!label.test(text)) continue;
+    const button = node.closest("button, [role='button'], .ds-button") || node;
+    if (visible(button)) found = button;      // last match: the one furthest down
+  }
+  if (!found) return null;
+  found.click();
+  return (found.innerText || "").trim() || "Continue";
+    });
+  } catch (err) {
+    console.log("continue: probe failed: " + err);
+    return null;                 // never let the probe break a turn
+  }
+};
 """
 
 JS_CHECK_LOGIN = PRELUDE + r"""
@@ -681,7 +716,17 @@ const emitSnapshot = async (candidate) => {
   writeSnapshot(reasoning, answer, seconds);
 };
 let sawAny = false;
+const MAX_CONTINUE_CLICKS = 100;
+const answerLength = (msg) => ((msg.fragments || [])
+  .map((f) => f.content || "").join("")).length;
+let continues = 0;
+let longest = 0;
+let clicksWithoutGrowth = 0;
+let lastClick = 0;
+let lastGrowth = started;
+let candidate = null;
 while (Date.now() - started < BUDGET) {
+  candidate = null;
   if (chatId) {
     const res = await apiGet("/api/v0/chat/history_messages?chat_session_id=" + chatId);
     polls += 1;
@@ -691,10 +736,33 @@ while (Date.now() - started < BUDGET) {
     // was refused and polling for an answer would burn the whole budget.
     if (messages.some((m) => (m.message_id || 0) > baseline)) sawAny = true;
     const fresh = messages.filter((m) => (m.message_id || 0) > baseline && m.role === "ASSISTANT");
-    const candidate = fresh[fresh.length - 1];
+    candidate = fresh[fresh.length - 1] || null;
     if (candidate || chatId) await emitSnapshot(candidate);
+    if (candidate) {
+      const length = answerLength(candidate);
+      if (length > longest) {
+        longest = length;
+        clicksWithoutGrowth = 0;
+        lastGrowth = Date.now();
+      }
+    }
     if (candidate && String(candidate.status || "").toUpperCase() === "FINISHED" &&
         (candidate.fragments || []).some((f) => (f.content || "").length > 0)) {
+      // A visible "Continue" means the answer stopped early. Click it and keep
+      // polling instead of accepting a truncated reply. Three clicks in a row
+      // with no new text mean the button is stale, so the answer is final.
+      if (continues < MAX_CONTINUE_CLICKS && clicksWithoutGrowth < 3 &&
+          Date.now() - lastClick > 1200) {
+        const clicked = await clickContinue();
+        if (clicked) {
+          continues += 1;
+          clicksWithoutGrowth += 1;
+          lastClick = Date.now();
+          console.log("continue: clicked " + clicked + " (#" + continues + ")");
+          await sleep(600);
+          continue;
+        }
+      }
       assistant = candidate;
       break;
     }
@@ -703,6 +771,19 @@ while (Date.now() - started < BUDGET) {
     blocked = await bannerText();
     if (!blocked && !lastError && Date.now() - started > 20000) blocked = "send_blocked";
     if (blocked) break;
+  }
+  // Stalled mid-turn: the text has not grown for a few seconds and the newest
+  // assistant message offers Continue. Only a real message is in scope, so an
+  // older conversation's button can never be clicked here.
+  if (!blocked && candidate && continues < MAX_CONTINUE_CLICKS &&
+      Date.now() - lastClick > 1200 && Date.now() - lastGrowth > 4000) {
+    const clicked = await clickContinue();
+    if (clicked) {
+      continues += 1;
+      lastClick = Date.now();
+      lastGrowth = Date.now();
+      console.log("continue: clicked " + clicked + " mid-turn (#" + continues + ")");
+    }
   }
   await sleep(700);
 }
@@ -738,6 +819,7 @@ __done({
   dom,
   thinking: thinking,
   polls,
+  continues,
   error: blocked || lastError || (assistant ? null : "timed_out_waiting_for_answer"),
   blocked: blockedTurn,
   detail: blocked || null
@@ -971,7 +1053,8 @@ class Handler(BaseHTTPRequestHandler):
         reasoning = fragments_to_text(fragments, "THINK") or dom.get("reasoning", "")
         answer = fragments_to_text(fragments, "RESPONSE") or dom.get("answer", "")
         dbg(f"send: {len(fragments)} fragment(s), reasoning {len(reasoning)} chars, "
-            f"answer {len(answer)} chars, polls {raw.get('polls')}")
+            f"answer {len(answer)} chars, polls {raw.get('polls')}"
+            f"{' continues ' + str(raw.get('continues')) if raw.get('continues') else ''}")
         return {
             "ok": True,
             "chat_id": raw.get("chat_id"),
